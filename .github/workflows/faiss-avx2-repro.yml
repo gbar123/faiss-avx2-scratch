@@ -1,0 +1,81 @@
+name: faiss-avx2-repro-scratch
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm arch
+        run: uname -m
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pinned faiss-cpu
+        run: pip install faiss-cpu==1.8.0 numpy
+
+      - name: Confirm AVX2 kernel dispatch
+        run: |
+          python -c "
+          import faiss
+          print('faiss version:', faiss.__version__)
+          print('has avx2 support:', getattr(faiss, 'available_faiss_avx2_extension', lambda: 'n/a')())
+          import faiss.loader as ld
+          print('loader module:', ld.__file__)
+          "
+
+      - name: Repro k >> efSearch on 82k-vector HNSW index
+        env:
+          FAISS_OPT_LEVEL: AVX2
+        run: |
+          cat > repro.py <<'EOF'
+          import faiss, numpy as np, time, sys
+
+          print("faiss version:", faiss.__version__, flush=True)
+          d = 512
+          n = 82000
+          np.random.seed(1)
+          mat = np.random.randn(n, d).astype('float32')
+          faiss.normalize_L2(mat)
+
+          index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
+          index.hnsw.efConstruction = 200
+
+          t0 = time.time()
+          index.add(mat)
+          print(f"build={time.time()-t0:.1f}s ntotal={index.ntotal}", flush=True)
+
+          def blended_query(rng):
+              parts = [rng.standard_normal(d).astype('float32') for _ in range(3)]
+              weights = [0.40, 0.25, 0.35]
+              units = []
+              for p in parts:
+                  n_ = np.linalg.norm(p)
+                  units.append(p / n_)
+              stacked = np.stack(units, axis=0)
+              w = np.array(weights, dtype=np.float64)
+              w = w / w.sum()
+              blended = (stacked * w.reshape(-1,1)).sum(axis=0).astype('float32')
+              blended /= np.linalg.norm(blended)
+              return blended.reshape(1, -1)
+
+          rng = np.random.default_rng(42)
+
+          for ef in (64, 32, 16):
+              index.hnsw.efSearch = ef
+              for k in (150, 1000, 3000, 5000, 10000):
+                  k = min(k, index.ntotal)
+                  for trial in range(3):
+                      q = blended_query(rng)
+                      t0 = time.time()
+                      D, I = index.search(q, k)
+                      dt = time.time() - t0
+                      unfilled = int((I[0] == -1).sum())
+                      print(f"ef={ef} k={k} trial={trial} time={dt:.3f}s unfilled={unfilled}", flush=True)
+
+          print("DONE - no crash", flush=True)
+          EOF
+          python repro.py
